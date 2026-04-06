@@ -52,6 +52,12 @@ constexpr double EXTRAN_CROWN_CUTOFF = 0.96;       ///< EXTRAN surcharge fractio
 constexpr double SLOT_CROWN_CUTOFF   = 0.985257;   ///< Preissmann slot crown cutoff
 constexpr double SLOT_WIDTH_FACTOR   = 0.001;       ///< Slot width = y_full * this factor
 
+// Dynamic Preissmann Slot (DPS) constants — Sharior, Hodges, & Vasconcelos (2023)
+constexpr double DPS_DEFAULT_TARGET_CELERITY = 100.0;   ///< Default target celerity c_T (m/s)
+constexpr double DPS_DEFAULT_SHOCK_PARAM     = 2.0;     ///< Default surcharge shock parameter β
+constexpr double DPS_DEFAULT_DECAY_TIME      = 10.0;    ///< Default decay time scale r (s)
+constexpr double DPS_CROWN_CUTOFF            = 0.985257; ///< Crown cutoff for DPS (same as SLOT)
+
 // ============================================================================
 // Per-node extended state for DW iterations
 // ============================================================================
@@ -122,6 +128,30 @@ public:
     double omega      = OMEGA;
     SurchargeMethod surcharge_method = SurchargeMethod::EXTRAN;
 
+    // DPS parameters (only used when surcharge_method == DYNAMIC_SLOT)
+    double dps_target_celerity = DPS_DEFAULT_TARGET_CELERITY; ///< Target pressure celerity c_T (ft/s or m/s)
+    double dps_shock_param     = DPS_DEFAULT_SHOCK_PARAM;     ///< Surcharge shock parameter β
+    double dps_decay_time      = DPS_DEFAULT_DECAY_TIME;      ///< Decay time scale r (s)
+
+    // --- DPS state and helpers (public for unit-test access) ---
+
+    // Per-link Dynamic Preissmann Slot state (Sharior et al. 2023)
+    std::vector<double> dps_slot_area_;    ///< Cumulative transient storage area T_s (ft²)
+    std::vector<double> dps_slot_head_;    ///< Cumulative surcharge head h_s (ft)
+    std::vector<double> dps_preissmann_;   ///< Current Preissmann Number P (-)
+    std::vector<double> dps_surcharge_t_;  ///< Time since element first surcharged (s), <0 = not surcharged
+
+    // Preissmann slot helpers (matching legacy dwflow.c)
+    double getSlotWidth(double y, double y_full, double w_max, XsectShape shape) const;
+    double getSlotArea(double y, double y_full, double a_full, double slot_width) const;
+    double getSlotHydRad(double y, double y_full, double r_full) const;
+    double getCrownCutoff() const;
+
+    // Dynamic Preissmann Slot helpers (Sharior et al. 2023)
+    double computePreissmannNumber(int link_idx, double dt) const;
+    double computeInitialPreissmannNumber(int link_idx, const SimulationContext& ctx) const;
+    void   updateDPSState(SimulationContext& ctx, double dt);
+
 private:
     int n_nodes_ = 0;
     int n_links_ = 0;
@@ -175,12 +205,6 @@ private:
     bool updateNodeDepths(SimulationContext& ctx, double dt, int step);
     void setNodeDepth(SimulationContext& ctx, int node_idx, double dt, int step);
     double getLinkStep(const SimulationContext& ctx, int link_idx) const;
-
-    // Preissmann slot helpers (matching legacy dwflow.c)
-    double getSlotWidth(double y, double y_full, double w_max, XsectShape shape) const;
-    double getSlotArea(double y, double y_full, double a_full, double slot_width) const;
-    double getSlotHydRad(double y, double y_full, double r_full) const;
-    double getCrownCutoff() const;
 };
 
 } // namespace dynwave

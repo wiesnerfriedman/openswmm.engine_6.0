@@ -63,7 +63,8 @@ static constexpr double FUDGE   = 0.0001;
 // ============================================================================
 
 double DWSolver::getCrownCutoff() const {
-    if (surcharge_method == SurchargeMethod::SLOT)
+    if (surcharge_method == SurchargeMethod::SLOT ||
+        surcharge_method == SurchargeMethod::DYNAMIC_SLOT)
         return SLOT_CROWN_CUTOFF;
     return EXTRAN_CROWN_CUTOFF;
 }
@@ -92,7 +93,8 @@ double DWSolver::getSlotWidth(double y, double y_full, double w_max,
 
     double yNorm = y / y_full;
 
-    if (surcharge_method == SurchargeMethod::SLOT) {
+    if (surcharge_method == SurchargeMethod::SLOT ||
+        surcharge_method == SurchargeMethod::DYNAMIC_SLOT) {
         if (yNorm < SLOT_CROWN_CUTOFF) return 0.0;
         // For depth > 1.78 * pipe depth, slot width = 1% of max width
         if (yNorm > 1.78) return 0.01 * w_max;
@@ -135,6 +137,160 @@ double DWSolver::getSlotHydRad(double y, double y_full, double r_full) const {
 }
 
 // ============================================================================
+// Dynamic Preissmann Slot helpers (Sharior, Hodges, & Vasconcelos 2023)
+// ============================================================================
+
+/**
+ * @brief Compute initial Preissmann Number for an unpressurized conduit.
+ *
+ * @details From Eq. (23): P_0 = c_T / (beta * c_g)
+ *   where c_g = sqrt(g * A_f / W_max) is the gravity-wave celerity at
+ *   near-full conditions and beta is the surcharge shock parameter.
+ */
+double DWSolver::computeInitialPreissmannNumber(int link_idx,
+                                                const SimulationContext& ctx) const {
+    auto uj = static_cast<std::size_t>(link_idx);
+    const auto& links = ctx.links;
+
+    double af = links.xsect_a_full[uj];
+    double wm = links.xsect_w_max[uj];
+    if (wm <= 0.0 || af <= 0.0) return 1.0;
+
+    // Gravity-wave celerity at full: c_g = sqrt(g * h_d) where h_d = A_f / W_max
+    double hd = af / wm;
+    double cg = std::sqrt(GRAVITY * hd);
+    if (cg <= 0.0) return 1.0;
+
+    double p0 = dps_target_celerity / (dps_shock_param * cg);
+    // P_0 should be > 1 for incipient surcharge (celerity < target)
+    return std::max(p0, 1.0);
+}
+
+/**
+ * @brief Compute Preissmann Number at the current time for a surcharged conduit.
+ *
+ * @details From Eq. (22): P(t) = 1 - (1 - P_0) * exp(-(t - t_0) / r)
+ *   The Preissmann Number decays from P_0 toward 1 (i.e., local celerity
+ *   approaches the target celerity c_T) over the decay time scale r.
+ *
+ * @param link_idx Link index.
+ * @param dt Current timestep (seconds) — used to advance surcharge time.
+ * @returns Current Preissmann Number P.
+ */
+double DWSolver::computePreissmannNumber(int link_idx, double dt) const {
+    auto uj = static_cast<std::size_t>(link_idx);
+
+    double t_surcharge = dps_surcharge_t_[uj];
+    if (t_surcharge < 0.0) {
+        // Not yet surcharged — return a large P_0 (set by caller)
+        return dps_preissmann_[uj];
+    }
+
+    double p0 = dps_preissmann_[uj];  // Initial P at onset of surcharge
+    if (dps_decay_time <= 0.0) return 1.0;  // Infinite rate → immediate convergence
+
+    // Eq. (22): P(t) = 1 - (1 - P_0) * exp(-t / r)
+    double p = 1.0 - (1.0 - p0) * std::exp(-t_surcharge / dps_decay_time);
+    return std::max(p, 1.0);  // P >= 1 always
+}
+
+/**
+ * @brief Update DPS state for all links after continuity has been solved.
+ *
+ * @details Implements the DPS time-marching algorithm (Sharior et al. 2023):
+ *   1. Compute incremental slot area from excess volume (Eq. 14)
+ *   2. Compute incremental surcharge head from P and dTs (Eq. 19)
+ *   3. Update cumulative slot area and head
+ *   4. Advance Preissmann Number via decay model (Eq. 22)
+ *   5. Track surcharge onset/cessation
+ *
+ * @param ctx Simulation context (links must have updated volume).
+ * @param dt Timestep (seconds).
+ */
+void DWSolver::updateDPSState(SimulationContext& ctx, double dt) {
+    auto& links = ctx.links;
+
+    for (int j = 0; j < n_links_; ++j) {
+        auto uj = static_cast<std::size_t>(j);
+        if (links.type[uj] != LinkType::CONDUIT) continue;
+
+        double af = links.xsect_a_full[uj];
+        double yf = links.xsect_y_full[uj];
+        double length = links.mod_length[uj];
+        if (length <= 0.0) length = links.length[uj];
+        if (af <= 0.0 || length <= 0.0) continue;
+
+        // Check if conduit is open (no slot for open shapes)
+        XsectShape shape = links.xsect_shape[uj];
+        bool is_open = (shape == XsectShape::RECT_OPEN ||
+                        shape == XsectShape::TRAPEZOIDAL ||
+                        shape == XsectShape::TRIANGULAR ||
+                        shape == XsectShape::PARABOLIC);
+        if (is_open) continue;
+
+        double v_full = af * length;
+        int barrels = std::max(links.barrels[uj], 1);
+        double v_current = links.volume[uj] / static_cast<double>(barrels);
+
+        double excess_v = v_current - v_full;
+
+        if (excess_v > 0.0) {
+            // --- Conduit is surcharged ---
+
+            // Track surcharge onset
+            if (dps_surcharge_t_[uj] < 0.0) {
+                // Newly surcharged: initialize P_0
+                dps_surcharge_t_[uj] = 0.0;
+                dps_preissmann_[uj] = computeInitialPreissmannNumber(j, ctx);
+                dps_slot_area_[uj]  = 0.0;
+                dps_slot_head_[uj]  = 0.0;
+            } else {
+                // Advance surcharge clock
+                dps_surcharge_t_[uj] += dt;
+            }
+
+            // Incremental slot area: delta_Ts = excess_V / L - Ts_old (Eq. 14)
+            double delta_ts = excess_v / length - dps_slot_area_[uj];
+
+            // Current Preissmann Number (from decay model, Eq. 22)
+            double P = computePreissmannNumber(j, dt);
+
+            // Incremental surcharge head: delta_hs = P^2 * delta_Ts / (Af + Ts_old)
+            // (Eq. 19 — key DPS equation)
+            double denom_a = af + dps_slot_area_[uj];
+            double delta_hs = 0.0;
+            if (denom_a > 0.0) {
+                delta_hs = P * P * delta_ts / denom_a;
+            }
+
+            // Update cumulative state
+            dps_slot_area_[uj] += delta_ts;
+            if (dps_slot_area_[uj] < 0.0) dps_slot_area_[uj] = 0.0;
+            dps_slot_head_[uj] += delta_hs;
+
+            // Prevent negative surcharge head while slot area is positive
+            // (hysteresis: Ts > 0 but hs <= 0 → treat as full but unpressurized)
+            if (dps_slot_head_[uj] < 0.0) dps_slot_head_[uj] = 0.0;
+
+        } else {
+            // --- Conduit depressurized ---
+            if (dps_surcharge_t_[uj] >= 0.0) {
+                // Was surcharged, now returning to free-surface
+                // Keep residual Ts for mass conservation (see paper discussion)
+                double ts_residual = excess_v / length;
+                if (ts_residual <= 0.0) {
+                    // Fully depressurized
+                    dps_slot_area_[uj]    = 0.0;
+                    dps_slot_head_[uj]    = 0.0;
+                    dps_preissmann_[uj]   = 0.0;
+                    dps_surcharge_t_[uj]  = -1.0;  // Mark as not surcharged
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Init
 // ============================================================================
 
@@ -171,6 +327,12 @@ void DWSolver::init(int n_nodes, int n_links, const XSectGroups& groups) {
     h1_.resize(ul, 0.0);
     h2_.resize(ul, 0.0);
     fasnh_.resize(ul, 1.0);
+
+    // DPS state
+    dps_slot_area_.resize(ul, 0.0);
+    dps_slot_head_.resize(ul, 0.0);
+    dps_preissmann_.resize(ul, 0.0);
+    dps_surcharge_t_.resize(ul, -1.0);  // negative = not surcharged
 }
 
 // ============================================================================
@@ -218,6 +380,12 @@ int DWSolver::execute(SimulationContext& ctx, double dt) {
 
         // Step 4: update node depths, check convergence
         converged = updateNodeDepths(ctx, dt, steps);
+
+        // Step 5: update DPS dynamic slot state (if DYNAMIC_SLOT method active)
+        if (surcharge_method == SurchargeMethod::DYNAMIC_SLOT) {
+            updateDPSState(ctx, dt);
+        }
+
         steps++;
 
         if (steps > 1 && converged) break;
@@ -308,7 +476,8 @@ void DWSolver::computeLinkGeometry(SimulationContext& ctx) {
         double y2 = std::max(h2 - z2, FUDGE);
 
         double yf = links.xsect_y_full[uj];
-        if (surcharge_method != SurchargeMethod::SLOT) {
+        if (surcharge_method != SurchargeMethod::SLOT &&
+            surcharge_method != SurchargeMethod::DYNAMIC_SLOT) {
             y1 = std::min(y1, yf);
             y2 = std::min(y2, yf);
         }
@@ -319,6 +488,23 @@ void DWSolver::computeLinkGeometry(SimulationContext& ctx) {
         h1_[uj] = h1;
         h2_[uj] = h2;
         fasnh_[uj] = 1.0;
+
+        // DPS head correction: when DYNAMIC_SLOT is active and the conduit
+        // is surcharged, replace the static-slot head above crown with the
+        // DPS-computed surcharge head. This prevents double-counting between
+        // the Sjoberg slot depth and the DPS Preissmann Number model.
+        if (surcharge_method == SurchargeMethod::DYNAMIC_SLOT &&
+            dps_surcharge_t_[uj] >= 0.0 && dps_slot_head_[uj] > 0.0) {
+            double z_crown1 = z1 + yf;
+            double z_crown2 = z2 + yf;
+            // If node head exceeds crown, use DPS head instead of slot-derived
+            if (h1 > z_crown1) {
+                h1_[uj] = z_crown1 + dps_slot_head_[uj];
+            }
+            if (h2 > z_crown2) {
+                h2_[uj] = z_crown2 + dps_slot_head_[uj];
+            }
+        }
     }
 
     // ---- STEP B: Batch widths from RAW depths (needed for surface area) ----
