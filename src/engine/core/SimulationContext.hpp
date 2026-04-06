@@ -295,6 +295,7 @@ struct SimulationContext {
     ExtInflowData    ext_inflows;
     DwfData          dwf_inflows;
     RDIIAssignData   rdii_assigns;
+    AMMAssignData    amm_assigns;
     PatternData      patterns;
 
     // =========================================================================

@@ -129,6 +129,7 @@ void SWMMEngine::register_builtin_handlers() {
     registry_.register_builtin("INFLOWS",       input::handle_inflows);
     registry_.register_builtin("DWF",           input::handle_dwf);
     registry_.register_builtin("RDII",          input::handle_rdii);
+    registry_.register_builtin("AMM",           input::handle_amm);
     registry_.register_builtin("LOADINGS",      input::handle_loadings);
     registry_.register_builtin("PATTERNS",      input::handle_patterns);
 
@@ -946,8 +947,8 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
     //     add external inflows, DWF, RDII on top
     inflow_.computeAll(ctx_, ctx_.current_date, dt_routing);
 
-    // B2a. RDII inflows (unit hydrograph convolution)
-    {
+    // B2a. RDII inflows (unit hydrograph convolution) — RTK method
+    if (ctx_.options.rdii_method == RdiiMethod::RTK) {
         // Use current month and average rainfall from gages
         int month = datetime::monthOfYear(ctx_.current_date) - 1; // 0-based
         double avg_rainfall = 0.0;
@@ -956,6 +957,17 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
         }
         if (ctx_.n_gages() > 0) avg_rainfall /= ctx_.n_gages();
         rdii_.computeAll(ctx_, avg_rainfall, month, dt_routing);
+    }
+
+    // B2a2. RDII inflows (antecedent moisture model) — AMM method
+    if (ctx_.options.rdii_method == RdiiMethod::AMM && amm_.componentCount() > 0) {
+        double avg_rainfall = 0.0;
+        for (int g = 0; g < ctx_.n_gages(); ++g) {
+            avg_rainfall += ctx_.gages.rainfall[static_cast<std::size_t>(g)];
+        }
+        if (ctx_.n_gages() > 0) avg_rainfall /= ctx_.n_gages();
+        double air_temp = climate_.temperature;   // current air temperature (deg F)
+        amm_.computeAll(ctx_, avg_rainfall, air_temp, dt_routing);
     }
 
     // B2b. Interface file inflows (from upstream model coupling)
@@ -1754,6 +1766,9 @@ void SWMMEngine::initHydraulics() noexcept {
 
     // 10a. RDII solver: initialize unit hydrograph groups
     rdii_.init(ctx_);
+
+    // 10a2. AMM solver: initialize antecedent moisture model groups
+    amm_.init(ctx_);
 
     // 10b. Exfiltration solver: initialize Green-Ampt state for storage nodes
     exfil_.init(ctx_);
